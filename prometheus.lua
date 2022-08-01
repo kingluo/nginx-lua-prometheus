@@ -59,6 +59,7 @@ local key_index_lib = require("prometheus_keys")
 local ngx = ngx
 local ngx_re_match = ngx.re.match
 local ngx_re_gsub = ngx.re.gsub
+local ngx_run_worker_thread = ngx.run_worker_thread
 local error = error
 local type = type
 local get_phase = ngx.get_phase
@@ -661,7 +662,7 @@ end
 --
 -- Returns:
 --   an object that should be used to register metrics.
-function Prometheus.init(dict_name, options_or_prefix)
+function Prometheus.init(dict_name, options_or_prefix, worker_thread_pool_name)
   if ngx.get_phase() ~= 'init' and ngx.get_phase() ~= 'init_worker' then
     error('Prometheus.init can only be called from ' ..
       'init_by_lua_block or init_worker_by_lua_block', 2)
@@ -670,6 +671,7 @@ function Prometheus.init(dict_name, options_or_prefix)
   local self = setmetatable({}, mt)
   dict_name = dict_name or "prometheus_metrics"
   self.dict_name = dict_name
+  self.worker_thread_pool_name = worker_thread_pool_name
   self.dict = ngx.shared[dict_name]
   if self.dict == nil then
     error("Dictionary '" .. dict_name .. "' does not seem to exist. " ..
@@ -870,40 +872,26 @@ function Prometheus:metric_data()
   self._counter:sync()
 
   local keys = self.key_index:list()
-  -- Prometheus server expects buckets of a histogram to appear in increasing
-  -- numerical order of their label values.
-  table.sort(keys)
 
-  local seen_metrics = {}
-  local output = {}
-  for _, key in ipairs(keys) do
-    yield()
-
-    local value, err = self.dict:get(key)
-    if value then
-      local short_name = short_metric_name(key)
-      if not seen_metrics[short_name] then
-        local m = self.registry[short_name]
-        if m then
-          if m.help then
-            table_insert_tail(output, string.format("# HELP %s%s %s\n",
-            self.prefix, short_name, m.help))
-          end
-          if m.typ then
-            table_insert_tail(output, string.format("# TYPE %s%s %s\n",
-              self.prefix, short_name, TYPE_LITERAL[m.typ]))
-          end
-        end
-        seen_metrics[short_name] = true
-      end
-      key = fix_histogram_bucket_labels(key)
-      table_insert_tail(output, string.format("%s%s %s\n", self.prefix, key, value))
-    else
-      if type(err) == "string" then
-        self:log_error("Error getting '", key, "': ", err)
-      end
+  local registry = {}
+  for k, v in pairs(self.registry) do
+    if v.help or v.typ then
+      registry[k] = {help = v.help, typ = v.typ}
     end
   end
+
+  local ok, output, err_keys = ngx_run_worker_thread(self.worker_thread_pool_name,
+    "prometheus_worker_thread", "shdict_metric_data", self.dict_name, keys, registry, self.prefix)
+  if not ok then
+    local err = output
+    ngx.log(ngx.ERR, "Prometheus shdict access from worker thread failed: ", err)
+    return
+  end
+
+  for key, err in pairs(err_keys) do
+    self:log_error("Error getting '", key, "': ", err)
+  end
+
   return output
 end
 
